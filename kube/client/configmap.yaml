@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grpc-client
+data:
+  GOGRPC_SERVER_ADDRESS: grpc-server.default.svc.cluster.local:50051
+  GOGRPC_MESSAGE: "gRPC client-side load balancing test"
+  GOGRPC_KUBE_PROBES_START: "true"

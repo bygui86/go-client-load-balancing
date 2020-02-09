@@ -2,14 +2,14 @@ syntax = "proto3";
 
 package domain;
 
-service HelloService {
-  rpc SayHello (HelloRequest) returns (HelloResponse);
+service EchoService {
+  rpc Echo (EchoRequest) returns (EchoResponse);
 }
 
-message HelloRequest {
-  string name = 1;
+message EchoRequest {
+  string message = 1;
 }
 
-message HelloResponse {
-  string greeting = 1;
+message EchoResponse {
+  string message = 1;
 }

@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/bygui86/go-grpc/utils"
+	"github.com/bygui86/go-grpc-client-lb/utils"
 )
 
 const (

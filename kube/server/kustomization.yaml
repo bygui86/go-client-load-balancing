@@ -1,0 +1,8 @@
+resources:
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+
+commonLabels:
+  app: grpc-server
+  group: grpc-client-lb-test

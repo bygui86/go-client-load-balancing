@@ -3,112 +3,132 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/resolver"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/bygui86/go-grpc-client-lb/client/grpc_client"
+	"github.com/bygui86/go-grpc-client-lb/domain"
+	"github.com/bygui86/go-grpc-client-lb/kubernetes"
+	"github.com/bygui86/go-grpc-client-lb/logger"
+	"github.com/bygui86/go-grpc-client-lb/utils"
+
 	"google.golang.org/grpc"
-	ecpb "google.golang.org/grpc/examples/features/proto/echo"
-	"google.golang.org/grpc/resolver"
 )
 
 const (
-	exampleScheme      = "example"
-	exampleServiceName = "lb.example.grpc.io"
+	serverAddressEnvVar  = "GOGRPC_SERVER_ADDRESS"
+	messageEnvVar        = "GOGRPC_MESSAGE"
+	kubeProbesNameEnvVar = "GOGRPC_KUBE_PROBES_START"
+
+	serverAddressEnvVarDefault  = "0.0.0.0:50051"
+	messageEnvVarDefault        = "Default message"
+	kubeProbesNameEnvVarDefault = false
+
+	// Available values: passthrough | dns
+	grpcResolverScheme = "dns"
+	grpcDefaultServiceConfig = `{
+	"loadBalancingPolicy": "%s"
+}
+`
 )
 
 func main() {
-	pickfirstConn, err := grpc.Dial(
-		fmt.Sprintf("%s:///%s", exampleScheme, exampleServiceName),
-		// grpc.WithBalancerName("pick_first"), // "pick_first" is the default, so this DialOption is not necessary.
-		grpc.WithInsecure(),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
+	serverAddress := utils.GetString(serverAddressEnvVar, serverAddressEnvVarDefault)
+	message := utils.GetString(messageEnvVar, messageEnvVarDefault)
+	kubeProbes := utils.GetBool(kubeProbesNameEnvVar, kubeProbesNameEnvVarDefault)
+
+	grpcConn := createGrpcConnection(serverAddress)
+	defer grpcConn.Close()
+	logger.SugaredLogger.Infof("gRPC connection ready to %s", serverAddress)
+
+	go startMessageSender(grpcConn, message)
+
+	if kubeProbes {
+		kubeServer := startKubernetes(grpcConn)
+		defer kubeServer.Shutdown()
 	}
-	defer pickfirstConn.Close()
 
-	fmt.Println("--- calling helloworld.Greeter/SayHello with pick_first ---")
-	makeRPCs(pickfirstConn, 10)
-
-	fmt.Println()
-
-	// Make another ClientConn with round_robin policy.
-	roundrobinConn, err := grpc.Dial(
-		fmt.Sprintf("%s:///%s", exampleScheme, exampleServiceName),
-		grpc.WithBalancerName("round_robin"), // This sets the initial balancing policy.
-		grpc.WithInsecure(),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	defer roundrobinConn.Close()
-
-	fmt.Println("--- calling helloworld.Greeter/SayHello with round_robin ---")
-	makeRPCs(roundrobinConn, 10)
+	logger.SugaredLogger.Info("gRPC client started!")
+	startSysCallChannel()
 }
 
-func callUnaryEcho(c ecpb.EchoClient, message string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+// createGrpcConnection -
+func createGrpcConnection(host string) *grpc.ClientConn {
+	resolver.SetDefaultScheme(grpcResolverScheme)
+
+	connection, err := grpc.Dial(
+		host,
+		//grpc.WithBalancerName(roundrobin.Name), // [Deprecated] This sets the initial balancing policy
+		grpc.WithDefaultServiceConfig(
+			fmt.Sprintf(grpcDefaultServiceConfig, roundrobin.Name),
+		),
+		grpc.WithInsecure(),
+		grpc.WithBlock(),
+	)
+
+	if err != nil {
+		logger.SugaredLogger.Errorf("Connection to gRPC server %s failed: %v", host, err.Error())
+		os.Exit(3)
+	}
+
+	logger.SugaredLogger.Info("State: ", connection.GetState())
+	logger.SugaredLogger.Info("Target: ", connection.Target())
+
+	return connection
+}
+
+// startMessageSender -
+func startMessageSender(connection *grpc.ClientConn, message string) {
+	timeout := 2 * time.Second
+	client := domain.NewEchoServiceClient(connection)
+	logger.SugaredLogger.Info("Starting message sender...")
+	for {
+		go sendMessage(client, timeout, message)
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// sendMessage -
+func sendMessage(client domain.EchoServiceClient, timeout time.Duration, message string) {
+	// WARNING: the connection context is one-shot, it must be refreshed before every request
+	connectionCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	r, err := c.UnaryEcho(ctx, &ecpb.EchoRequest{Message: message})
+	response, err := client.Echo(connectionCtx, &domain.EchoRequest{Message: message})
 	if err != nil {
-		log.Fatalf("could not greet: %v", err)
+		logger.SugaredLogger.Errorf("Could not send message %s: %v", message, err.Error())
+		return
 	}
-	fmt.Println(r.Message)
+	logger.SugaredLogger.Info(response.Message)
 }
 
-func makeRPCs(cc *grpc.ClientConn, n int) {
-	hwc := ecpb.NewEchoClient(cc)
-	for i := 0; i < n; i++ {
-		callUnaryEcho(hwc, "this is examples/load_balancing")
-	}
-}
-
-/*
-Following is an example name resolver implementation. Read the name resolution example to learn more about it.
-
-WARN: following piece of code is required to run the whole client load balancing example
- */
-
-var grpcServerIpAddresses = []string{"localhost:50051", "localhost:50052"}
-
-type exampleResolverBuilder struct{}
-
-func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
-	r := &exampleResolver{
-		target: target,
-		cc:     cc,
-		addrsStore: map[string][]string{
-			exampleServiceName: grpcServerIpAddresses,
+// startKubernetes -
+func startKubernetes(grpcConn *grpc.ClientConn) *kubernetes.KubeProbesServer {
+	kubeProbes := kubernetes.KubeProbes{
+		GrpcInterface: &grpc_client.GrpcClientService{
+			GrpcClientConn: grpcConn,
 		},
 	}
-	r.start()
-	return r, nil
-}
-
-func (*exampleResolverBuilder) Scheme() string { return exampleScheme }
-
-type exampleResolver struct {
-	target     resolver.Target
-	cc         resolver.ClientConn
-	addrsStore map[string][]string
-}
-
-func (r *exampleResolver) start() {
-	addrStrs := r.addrsStore[r.target.Endpoint]
-	addrs := make([]resolver.Address, len(addrStrs))
-	for i, s := range addrStrs {
-		addrs[i] = resolver.Address{Addr: s}
+	server, err := kubernetes.NewKubeProbesServer(kubeProbes)
+	if err != nil {
+		logger.SugaredLogger.Errorf("Kubernetes probes server creation failed: %s", err.Error())
+		os.Exit(2)
 	}
-	r.cc.UpdateState(resolver.State{Addresses: addrs})
+	logger.SugaredLogger.Debug("Kubernetes probes server successfully created")
+
+	server.Start()
+	logger.SugaredLogger.Debug("Kubernetes probes successfully started")
+
+	return server
 }
 
-func (*exampleResolver) ResolveNow(o resolver.ResolveNowOptions) {}
-
-func (*exampleResolver) Close()                                  {}
-
-func init() {
-	resolver.Register(&exampleResolverBuilder{})
+// startSysCallChannel -
+func startSysCallChannel() {
+	syscallCh := make(chan os.Signal)
+	signal.Notify(syscallCh, syscall.SIGTERM, syscall.SIGINT, os.Interrupt)
+	<-syscallCh
+	logger.SugaredLogger.Info("Termination signal received!")
 }
